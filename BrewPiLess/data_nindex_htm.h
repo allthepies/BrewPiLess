@@ -986,7 +986,7 @@ Set Beer temp:
 Set Fridge temp:
 <input type="text" size="6" id="fridge-t"></input>&deg;<span class="t_unit">C</span>
 </div>
-<div id="off-s" class="detail">Turning temperature controll Off.</div>
+<div id="off-s" class="detail">Turning temperature control off.</div>
 </div>
 <div id="dlg_loading" class="modal">
 <div class="modal-content">
