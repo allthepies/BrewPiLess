@@ -33,9 +33,8 @@
 //}brewpi
 
 #include "espconfig.h"
-
 #include "TimeKeeper.h"
-
+#include "mystrlib.h"
 #include "BrewKeeper.h"
 #ifdef ENABLE_LOGGING
 #include "DataLogger.h"
@@ -53,6 +52,8 @@ extern "C" {
 
 #include "BrewLogger.h"
 
+#include "ExternalData.h"
+
 //WebSocket seems to be unstable, at least on iPhone.
 //Go back to ServerSide Event.
 #define UseWebSocket false
@@ -64,19 +65,21 @@ extern "C" {
 /**************************************************************************************/
 static const char DefaultConfiguration[] PROGMEM =
 R"END(
-{"name":"brewpi",
-"user":"brewpi",
-"pass":"brewpi",
-"protect":0
+{"name":"brewpiless",
+"user":"brewpiless",
+"pass":"brewpiless",
+"protect":0,
+"ap":0
 }
 )END";
 
-static const char* configFormat =
+static const char configFormat[] PROGMEM =
 R"END(
 {"name":"%s",
 "user":"%s",
 "pass":"%s",
-"protect":%d
+"protect":%d,
+"ap":%d
 }
 )END";
 
@@ -113,6 +116,8 @@ R"END(
 
 #define CHART_LIB_PATH       "/dygraph-combined.js"
 
+#define GRAVITY_PATH       "/gravity"
+
 #define DEFAULT_INDEX_FILE     "index.htm"
 
 const char *public_list[]={
@@ -125,7 +130,10 @@ const char *nocache_list[]={
 };
 //*******************************************
 
+ExternalData externalData;
+
 bool passwordLcd;
+bool stationApMode;
 char username[32];
 char password[32];
 char hostnetworkname[32];
@@ -143,7 +151,7 @@ AsyncEventSource sse(SSE_PATH);
 #endif
 
 // use in sprintf, put into PROGMEM complicates it.
-const char *confightml=R"END(
+const char confightml[] PROGMEM =R"END(
 <html><head><title>Configuration</title></head><body>
 <form action="" method="post">
 <table>
@@ -151,6 +159,7 @@ const char *confightml=R"END(
 <tr><td>User Name</td><td><input name="user" type="text" size="12" maxlength="16" value="%s"></td></tr>
 <tr><td>Password</td><td><input name="pass" type="password" size="12" maxlength="16" value="%s"></td></tr>
 <tr><td>Always need password</td><td><input type="checkbox" name="protect" value="yes" %s></td></tr>
+<tr><td>Always softAP</td><td><input type="checkbox" name="ap" value="yes" %s></td></tr>
 <tr><td>Save Change</td><td><input type="submit" name="submit"></input></td></tr>
 </table></form></body></html>)END";
 
@@ -320,7 +329,19 @@ public:
 	        return request->requestAuthentication();
 
 			AsyncResponseStream *response = request->beginResponseStream("text/html");
-			response->printf(confightml,hostnetworkname,username,password,(passwordLcd? "checked=\"checked\"":" "));
+		
+		  	int size=strlen_P(confightml);
+  			char *fmt=(char*) malloc(size +1);
+  				if(!fmt){
+  					request->send(500);
+					DBG_PRINTF("!!Alloc error\n");
+  					return;
+  				}
+
+  			strcpy_P(fmt,confightml);
+
+			response->printf(fmt,hostnetworkname,username,password,(passwordLcd? "checked=\"checked\"":""),(stationApMode? "checked=\"checked\"":""));
+			free(fmt);
 			request->send(response);
 	 	}else if(request->method() == HTTP_POST && request->url() == CONFIG_PATH){
 	 	    if(!request->authenticate(username, password))
@@ -340,10 +361,25 @@ public:
   					return;
   				}
   				
-  				int protect = 0;
-  				if(request->hasParam("protect", true)) protect=1;
-  				
-  				config.printf(configFormat,name->value().c_str(),user->value().c_str(),pass->value().c_str(),protect);
+  				int protect =(request->hasParam("protect", true))? 1:0;
+  				int ap = (request->hasParam("ap", true))? 1:0;
+  				DBG_PRINTF("STA_AP mode? %d\n",ap);
+
+  				int size=strlen_P(configFormat);
+  				char *fmt=(char*) malloc(size +1);
+  				if(!fmt){
+  					request->send(500);
+					DBG_PRINTF("!!Alloc error\n");
+  					return;
+  				}
+  				strcpy_P(fmt,configFormat);
+
+  				config.printf(fmt,name->value().c_str(),
+  											user->value().c_str(),
+  											pass->value().c_str(),
+  											protect,ap);
+  				free(fmt);
+  				config.flush();
   				config.close();
 				sendProgmem(request,saveconfightml); //request->send(200,"text/html",saveconfightml);
 				requestRestart(false);
@@ -559,9 +595,12 @@ void notifyLogStatus(void)
 {
 	stringAvailable("V:{\"reload\":\"chart\"}");
 }
+#define MAX_DATA_SIZE 256
 
 class LogHandler:public AsyncWebHandler
 {
+public:
+	
 	void handleRequest(AsyncWebServerRequest *request){
 		if( request->url() == LOGLIST_PATH){
 			if(request->hasParam("dl")){
@@ -599,7 +638,6 @@ class LogHandler:public AsyncWebHandler
 			}
 			return;
 		} // end of logist path
-		
 		// charting
 		
 		int offset;
@@ -657,15 +695,117 @@ class LogHandler:public AsyncWebHandler
 		}	
 	}
 	
-public:
 	LogHandler(){}
 	bool canHandle(AsyncWebServerRequest *request){
 	 	if(request->url() == CHART_DATA_PATH || request->url() ==LOGLIST_PATH) return true;
 	 	return false;
-	}
-
+	}	
 };
 LogHandler logHandler;
+
+
+#define GavityDeviceConfigFilename "/gdconfig"
+#define GravityDeviceConfigPath "/gdc"
+
+class ExternalDataHandler:public AsyncWebHandler
+{
+private:
+	char _data[MAX_DATA_SIZE];
+	size_t _dataLength;
+	bool   _error;
+	
+	void processGravity(AsyncWebServerRequest *request,char data[],size_t length){
+		if(length ==0) return request->send(500);;
+
+        uint8_t error;
+		if(externalData.processJSON(data,length,request->authenticate(username, password),error)){
+    		request->send(200,"application/json","{}");
+		}else{
+		    if(error == ErrorAuthenticateNeeded) return request->requestAuthentication();
+		    else request->send(500);
+		}
+	}
+
+public:
+
+	ExternalDataHandler(){
+	}
+		
+	void loadConfig(void){
+	    char *buf=_data;
+		File config=SPIFFS.open(GavityDeviceConfigFilename,"r+");
+		if(config){
+			size_t len=config.readBytes(buf,MAX_DATA_SIZE);
+			buf[len]='\0';
+			externalData.config(buf);
+		}
+		config.close();		
+	}
+	
+	bool canHandle(AsyncWebServerRequest *request){
+	 	if(request->url() == GRAVITY_PATH	) return true;
+	 	if(request->url() == GravityDeviceConfigPath) return true;
+	 	
+	 	return false;
+	}
+
+	void handleRequest(AsyncWebServerRequest *request){
+		if(request->url() == GRAVITY_PATH){
+			if(request->method() != HTTP_POST){
+				request->send(400);
+				return;
+			}
+			
+			processGravity(request,_data,_dataLength);
+			// Process the name
+			externalData.sseNotify(_data);
+			stringAvailable(_data);
+			return;
+		}
+		// config
+		if(request->method() == HTTP_POST){
+			// post
+  				
+  			File config=SPIFFS.open(GavityDeviceConfigFilename,"w+");	
+  			if(!config){
+  				request->send(500);
+  				return;
+  			} 			
+  			config.printf(_data);
+  			config.flush();
+  			config.close();
+  			externalData.config(_data);
+  			request->send(200);
+  			
+		}//else{
+			// get
+		if(request->hasParam("data")){
+		    request->send(SPIFFS,GavityDeviceConfigFilename, "application/json");
+		}else{
+		    // get the HTML
+		    request->send_P(200, "text/html", externalData.html());
+		}
+	}
+	
+	void handleBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+		if(!index){
+		    //DBG_PRINTF("BodyStart: %u B\n", total);
+			_dataLength =0;
+			_error=(total >= MAX_DATA_SIZE); 
+		}
+		
+		if(_error) return;
+		for(size_t i=0; i< len; i++){
+			//Serial.write(data[i]);
+			_data[_dataLength ++] = data[i];
+		}
+		if(index + len == total){
+			_data[_dataLength]='\0';
+			//DBG_PRINTF("Body total%u data:%s\n", total,_data);			
+		}
+	}
+};
+ExternalDataHandler externalDataHandler;
 
 //{brewpi
 
@@ -831,26 +971,30 @@ void setup(void){
 
 	#if SerialDebug == true
   	DebugPort.begin(115200);
-  	DBG_PRINTF("\n");
+  	DBG_PRINTF("\nSetup()\n");
   	DebugPort.setDebugOutput(true);
   	#endif
-
-
-#ifdef EARLY_DISPLAY
-	display.init();
-	display.printAt_P(1,0,PSTR("Initialize WiFi"));
-	display.updateBacklight();
-#endif
-	
- 
+	 
 	//0.Initialize file system
 	//start SPI Filesystem
   	if(!SPIFFS.begin()){
   		// TO DO: what to do?
-  		DBG_PRINTF("SPIFFS.being() failed");
+  		DBG_PRINTF("SPIFFS.being() failed!\n");
   	}else{
-  		DBG_PRINTF("SPIFFS.being() Success");
+  		DBG_PRINTF("SPIFFS.being() Success.\n");
   	}
+	
+    WiFiSetup.preInit();
+    
+#ifdef EARLY_DISPLAY
+	DBG_PRINTF("Init LCD...\n");
+	display.init();
+	display.printAt_P(1,0,PSTR("Initialize WiFi"));
+	display.updateBacklight();
+	DBG_PRINTF("LCD Initialized..\n");
+#endif
+	
+	
 	// try open configuration
 	char configBuf[MAX_CONFIG_LEN];
 	File config=SPIFFS.open(CONFIG_FILENAME,"r+");
@@ -863,45 +1007,48 @@ void setup(void){
 	}
 
 	JsonObject& root = jsonBuffer.parseObject(configBuf);
-	const char* host;
-	
+	//const char* host;
 	if(!config
 			|| !root.success()
 			|| !root.containsKey("name")
 			|| !root.containsKey("user")
-			|| !root.containsKey("pass")){
-		
+			|| !root.containsKey("pass"))
+	{		
 		strcpy_P(configBuf,DefaultConfiguration);
-		JsonObject& root = jsonBuffer.parseObject(configBuf);
-  		strcpy(hostnetworkname,root["name"]);
-  		strcpy(username,root["user"]);
-  		strcpy(password,root["pass"]);
-		passwordLcd=(bool)root["protect"];
-		
+		JsonObject& root = jsonBuffer.parseObject(configBuf);		
+  	strcpy(hostnetworkname,root["name"]);
+  	strcpy(username,root["user"]);
+  	strcpy(password,root["pass"]);
+  	passwordLcd=(root.containsKey("protect"))? (bool)(root["protect"]):false;
+	stationApMode=(root.containsKey("ap"))? (bool)(root["protect"]):false;
+
 	}else{
-		config.close();
-		  	
-  		strcpy(hostnetworkname,root["name"]);
-  		strcpy(username,root["user"]);
-  		strcpy(password,root["pass"]);
-  		passwordLcd=(root.containsKey("protect"))? (bool)(root["protect"]):false;
+		config.close();	  	
+  	strcpy(hostnetworkname,root["name"]);
+  	strcpy(username,root["user"]);
+  	strcpy(password,root["pass"]);
+  	passwordLcd=(root.containsKey("protect"))? (bool)(root["protect"]):false;
+	stationApMode=(root.containsKey("ap"))? (bool)(root["ap"]):false;
+
   	}
+	DBG_PRINTF("STA_AP mode? %d\n",stationApMode);
 	#ifdef ENABLE_LOGGING
   	dataLogger.loadConfig();
   	#endif
   	
-  	WiFi.hostname(hostnetworkname);
   	
 	//1. Start WiFi 
+	DBG_PRINTF("Starting WiFi...\n");
+	WiFiSetup.setApStation(stationApMode);
 	WiFiSetup.setTimeout(CaptivePortalTimeout);
-	WiFiSetup.begin(hostnetworkname);
+	WiFiSetup.begin(hostnetworkname,password);
 
   	DBG_PRINTF("WiFi Done!\n");
 
 	// get time
 	initTime(WiFiSetup.isApMode());
 	
-	if (!MDNS.begin(hostnetworkname)) {
+	if (!MDNS.begin(hostnetworkname,WiFi.localIP())) {
 			DBG_PRINTF("Error setting mDNS responder\n");
 	}else{
 		MDNS.addService("http", "tcp", 80);
@@ -932,6 +1079,11 @@ void setup(void){
 #if UseServerSideEvent == true
 	sse.onConnect([](AsyncEventSourceClient *client){
 		DBG_PRINTF("SSE Connect\n");
+		if(externalData.iSpindelEnabled()){
+			char buf[128];
+			externalData.sseNotify(buf);
+			sse.send(buf);
+		}
   	});
 	server.addHandler(&sse);
 #endif
@@ -939,6 +1091,10 @@ void setup(void){
 	server.addHandler(&brewPiWebHandler);
 	
 	server.addHandler(&logHandler);
+
+	externalDataHandler.loadConfig();
+	server.addHandler(&externalDataHandler);
+	
 	//3.1.2 SPIFFS is part of the serving pages
 	//server.serveStatic("/", SPIFFS, "/","public, max-age=259200"); // 3 days
 
@@ -1011,10 +1167,7 @@ void loop(void){
 		display.printStatus(buf);
 	}
 #endif
-	char unit, mode;
-	float beerSet,fridgeSet;
-	brewPi.getControlParameter(&unit,&mode,&beerSet,&fridgeSet);
-  	brewKeeper.keep(now,unit,mode,beerSet);
+  	brewKeeper.keep(now);
   	
   	brewPi.loop();
  	
@@ -1022,9 +1175,7 @@ void loop(void){
  	
  	#ifdef ENABLE_LOGGING
 
- 	dataLogger.loop(now,[](float *pBeerTemp,float *pBeerSet,float *pFridgeTemp, float *pFridgeSet){
- 			brewPi.getTemperature(pBeerTemp,pBeerSet,pFridgeTemp,pFridgeSet);
- 		});
+ 	dataLogger.loop(now);
  	#endif
  	
 	if(!IS_RESTARTING){
@@ -1045,99 +1196,3 @@ void loop(void){
   		}
   	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

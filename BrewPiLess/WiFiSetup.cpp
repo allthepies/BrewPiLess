@@ -3,8 +3,11 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
+#include <FS.h>
 #include "espconfig.h"
 #include "WiFiSetup.h"
+
+#define IPConfigFileName "ip.cfg"
 
 WiFiSetupClass WiFiSetup;
 
@@ -32,8 +35,90 @@ void WiFiSetupClass::enterApMode(void)
 }
 static bool _apEntered=false;
 
+bool startSetupPortal(WiFiManager& wifiManager,const char* ssid,const char*pass)
+{
+    WiFiManagerParameter ipAddress("staticip", "Static IP", "", 16);
+    WiFiManagerParameter gateway("gateway", "Gateway",  "", 16);
+    WiFiManagerParameter netmask("netmask", "Net Mask", "255.255.255.0", 16);
+
+    wifiManager.addParameter(&ipAddress);
+    wifiManager.addParameter(&gateway);
+    wifiManager.addParameter(&netmask);
+
+  	bool connected= wifiManager.startConfigPortal(ssid,pass);
+    if(connected){
+        //SAVE configuration.
+        File fh= SPIFFS.open(IPConfigFileName, "w");
+        if(!fh){
+            DBG_PRINTF("Error opening file!!\n");
+    	    return connected;
+        }
+        fh.println(ipAddress.getValue());
+        fh.println(gateway.getValue());
+        fh.println(netmask.getValue());
+        fh.close();
+    
+        DBG_PRINTF("Save IP:%s, GW:%s, SM:%s\n",ipAddress.getValue(),gateway.getValue(),netmask.getValue());
+    }
+  	return connected;
+}
+void scanIP(File& fh,IPAddress& ip)
+{
+    char buffer[20];
+    size_t len=fh.readBytesUntil('\n', buffer, 20);
+    buffer[len]='\0';
+    // DBG_PRINTF("Scan IP length=%d :\"%s\"\n",len,buffer);
+    // this doesn't work. the last byte always 0: ip.fromString(buffer);
+    
+    int Parts[4] = {0,0,0,0};
+    int Part = 0;
+    for ( int i=0; i<len-1; i++ )
+    {
+	    char c = buffer[i];
+	    if ( c == '.' )
+	    {
+		    Part++;
+		    continue;
+	    }
+	    Parts[Part] *= 10;
+	    Parts[Part] += c - '0';
+    }
+    
+    IPAddress sip( Parts[0], Parts[1], Parts[2], Parts[3] );    
+    ip = sip;
+    //Serial.print("result:");
+    //Serial.println(ip);
+}
+
+void WiFiSetupClass::preInit(void)
+{
+        File fh= SPIFFS.open(IPConfigFileName, "r");
+        if(fh){
+            DBG_PRINTF("Static IP Setting Exists:\n");
+
+            IPAddress ip;
+            scanIP(fh,ip);
+            
+            if(ip == (uint32_t)0){
+                DBG_PRINTF("Invalid IP: 0.0.0\n");
+            }else{
+                IPAddress gateway;
+                IPAddress mask;
+                scanIP(fh,gateway);
+                scanIP(fh,mask);
+                                
+                WiFi.config(ip, gateway, mask);
+                
+            }
+            fh.close();
+
+        }
+}
+
 void WiFiSetupClass::startWiFiManager(bool portal)
 {
+	DBG_PRINTF("AP SSID:%s  pass:%s\n",_apName,_apPassword);
+	
 	WiFiManager wifiManager;
 	#if SerialDebug != true
 	wifiManager.setDebugOutput(false);
@@ -47,14 +132,46 @@ void WiFiSetupClass::startWiFiManager(bool portal)
     wifiManager.setAPCallback([](WiFiManager*){ _apEntered=true;});
 
     bool connected;
+
+  	WiFi.hostname(_apName);
+
     if(portal){
-    	connected=wifiManager.startConfigPortal(_apName,_apPassword);
+        startSetupPortal(wifiManager,_apName,_apPassword);
     }else{
-    	connected=wifiManager.autoConnect(_apName,_apPassword);
+ 		
+ 		if( _apStaMode){
+	    	WiFi.mode(WIFI_AP_STA);
+	    }else{
+	    	WiFi.mode(WIFI_STA);
+		}
+
+ 		if( WiFi.status() == WL_CONNECTED){
+ 			DBG_PRINTF("Already connected!!! who did it?\n");
+ 		}else{
+			WiFi.begin();
+			bool timeout = false;
+			int i=0;
+			while(WiFi.status() != WL_CONNECTED && !timeout) {
+        		delay(200);
+    			timeout = i++ > 100;
+   				DBG_PRINTF(".");
+    		}
+ 		}
+ 		// timeout or not
+		if(WiFi.status()==WL_CONNECTED){
+			connected=true;
+			if( _apStaMode){
+				// start a AP.
+				DBG_PRINTF("Start SoftAP\n");
+				WiFi.softAP(_apName,_apPassword);
+			}
+		}else{
+	    	connected=startSetupPortal(wifiManager,_apName,_apPassword);
+	    }
     }
-    if(!connected)	// not connected. setup AP mode
+    if(!connected){	// not connected. setup AP mode
     	enterApMode();
-    else{
+    }else{
     	// onced it enter AP mode, tcp_bind() lf lwip will return failure.
     	// thereore, restart the system.
     	if(_apEntered) ESP.restart();
@@ -123,42 +240,6 @@ void WiFiSetupClass::stayConnected(void)
   		}
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
